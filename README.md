@@ -3,6 +3,7 @@
 [![Release](https://img.shields.io/badge/release-v1.1.0-blue.svg)](https://github.com/Gleb200/WMF-Control-T2-Edition/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform: Windows 10 / 11 (x64)](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(x64)-informational.svg)]()
+<img width="900" height="600" alt="image" src="https://github.com/user-attachments/assets/82e84939-35a4-4bb9-be64-a031431e201b" />
 
 **Lightweight, low-overhead fan control and temperature monitor for Intel Macs running Windows 10/11 through Boot Camp.** 
 
