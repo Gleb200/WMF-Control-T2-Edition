@@ -381,6 +381,18 @@ impl Smc {
         matches!(self.t, Transport::Sim(_))
     }
 
+    /// Re-initialize the driver and MMIO window after sleep/resume or hardware reset.
+    pub fn reinit(&mut self, allow_mmio: bool) -> Result<()> {
+        if self.is_simulated() {
+            return Ok(());
+        }
+        self.info_cache.clear();
+        let io = crate::io::open_any()?;
+        let new_smc = Self::open(io, allow_mmio)?;
+        self.t = new_smc.t;
+        Ok(())
+    }
+
     fn raw_read(&mut self, cmd: u8, k: &Key, len: u8) -> Result<Vec<u8>> {
         match &mut self.t {
             Transport::Port(io) => port_read(io.as_ref(), cmd, k, len),
@@ -393,16 +405,41 @@ impl Smc {
         if let Some(c) = self.info_cache.get(k) {
             return *c;
         }
-        let info = match &mut self.t {
-            Transport::Mmio { base, .. } => mmio_info(*base, k).ok(),
-            _ => self.raw_read(CMD_KEY_INFO, k, 6).ok().map(|d| KeyInfo {
-                len: d[0],
-                ty: [d[1], d[2], d[3], d[4]],
-                flags: d[5],
-            }),
+        for _ in 0..3 {
+            let info = match &mut self.t {
+                Transport::Mmio { base, .. } => mmio_info(*base, k).ok(),
+                _ => self.raw_read(CMD_KEY_INFO, k, 6).ok().map(|d| KeyInfo {
+                    len: d[0],
+                    ty: [d[1], d[2], d[3], d[4]],
+                    flags: d[5],
+                }),
+            };
+            if let Some(info) = info {
+                self.info_cache.insert(*k, Some(info));
+                return Some(info);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Fallbacks for fan keys on Apple T2/Intel Mac if discovery timed out:
+        let fallback = if k == b"F1Tg" {
+            self.key_info(b"F0Tg").or(Some(KeyInfo { len: 2, ty: *b"fpe2", flags: 0xC0 }))
+        } else if k == b"F0Tg" {
+            Some(KeyInfo { len: 2, ty: *b"fpe2", flags: 0xC0 })
+        } else if k == b"F1Md" || k == b"F0Md" {
+            Some(KeyInfo { len: 1, ty: *b"ui8 ", flags: 0xC0 })
+        } else if k == b"F1Ac" {
+            self.key_info(b"F0Ac").or(Some(KeyInfo { len: 2, ty: *b"fpe2", flags: 0xC0 }))
+        } else {
+            None
         };
-        self.info_cache.insert(*k, info);
-        info
+
+        if let Some(fb) = fallback {
+            self.info_cache.insert(*k, Some(fb));
+            return Some(fb);
+        }
+
+        None
     }
 
     pub fn read_raw(&mut self, k: &Key) -> Result<(KeyInfo, Vec<u8>)> {

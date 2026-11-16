@@ -23,6 +23,111 @@ struct Editor {
     high: f64,
 }
 
+pub fn autostart_is_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let res = std::process::Command::new("schtasks")
+            .args(["/query", "/tn", "WMFControl"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        match res {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+pub fn set_autostart(enable: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if enable {
+            let exe = std::env::current_exe()?;
+            let exe_str = exe.to_string_lossy();
+            let parent_dir = exe.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>WMF Control</Author>
+    <URI>\WMFControl</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT5S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{}</Command>
+      <Arguments>--minimized</Arguments>
+      <WorkingDirectory>{}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"#,
+                exe_str, parent_dir
+            );
+
+            let temp_xml = std::env::temp_dir().join("wmf_task.xml");
+            let mut utf16_bytes: Vec<u8> = vec![0xFF, 0xFE];
+            for u in xml.encode_utf16() {
+                utf16_bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            std::fs::write(&temp_xml, &utf16_bytes)?;
+
+            let status = std::process::Command::new("schtasks")
+                .args(["/create", "/tn", "WMFControl", "/xml", &temp_xml.to_string_lossy(), "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+
+            let _ = std::fs::remove_file(&temp_xml);
+
+            let status = status?;
+            if !status.status.success() {
+                let err = String::from_utf8_lossy(&status.stderr);
+                anyhow::bail!("{err}");
+            }
+        } else {
+            let _ = std::process::Command::new("schtasks")
+                .args(["/delete", "/tn", "WMFControl", "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+    }
+    Ok(())
+}
+
 pub struct App {
     worker: Worker,
     /// The same worker, shared with the tray menu handlers.
@@ -33,28 +138,38 @@ pub struct App {
     fahrenheit: bool,
     show_all: bool,
     minimize_to_tray: bool,
+    start_minimized: bool,
+    autostart: bool,
+    autostart_err: Option<String>,
     poll_ms: u64,
     ctx: egui::Context,
     win: Arc<WindowCtl>,
     tray: Option<Tray>,
 }
 
-fn spawn(ctx: &egui::Context, demo: bool, no_mmio: bool) -> Worker {
+fn spawn(ctx: &egui::Context, demo: bool, no_mmio: bool, is_hidden: Arc<std::sync::atomic::AtomicBool>) -> Worker {
     let c = ctx.clone();
-    Worker::spawn(move || crate::open_smc(demo, no_mmio), move || c.request_repaint())
+    Worker::spawn(move || crate::open_smc(demo, no_mmio), move || c.request_repaint(), is_hidden, no_mmio)
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, demo: bool, no_mmio: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, demo: bool, no_mmio: bool, start_minimized: bool) -> Self {
         let cfg = Config::load();
         let ctx = cc.egui_ctx.clone();
-        let worker = spawn(&ctx, demo, no_mmio);
-        let worker_slot = Arc::new(Mutex::new(worker.clone()));
-        let win = WindowCtl::new(!cfg.no_minimize_to_tray);
+        let win = WindowCtl::new(!cfg.no_minimize_to_tray, start_minimized);
         if let Some(h) = hwnd_of(cc) {
             win.hwnd.store(h, Ordering::Relaxed);
+            if start_minimized {
+                win.hide();
+            }
         }
+        let worker = spawn(&ctx, demo, no_mmio, win.hidden.clone());
+        let worker_slot = Arc::new(Mutex::new(worker.clone()));
         let tray = Tray::new(worker_slot.clone(), win.clone(), ctx.clone()).ok();
+        let autostart = autostart_is_enabled();
+        if autostart {
+            let _ = set_autostart(true);
+        }
         App {
             worker,
             worker_slot,
@@ -64,10 +179,43 @@ impl App {
             fahrenheit: cfg.fahrenheit,
             show_all: cfg.show_all_sensors,
             minimize_to_tray: !cfg.no_minimize_to_tray,
+            start_minimized: cfg.start_minimized,
+            autostart,
+            autostart_err: None,
             poll_ms: cfg.poll_ms,
             ctx,
             win,
             tray,
+        }
+    }
+
+    fn update_tray(&mut self, snap: &Snapshot) {
+        let cpu_txt = snap.sensors.iter().find(|s| s.key == "TCXC" || s.key == "TC0P").map(|s| self.fmt_temp(s.value));
+        if let Some(t) = &mut self.tray {
+            use crate::config::Profile;
+            t.mode_auto.set_checked(snap.profile == Profile::Auto && !snap.full_blast);
+            t.mode_custom.set_checked(snap.profile == Profile::Custom && !snap.full_blast);
+            t.mode_silent.set_checked(snap.profile == Profile::Silent && !snap.full_blast);
+            t.mode_blast.set_checked(snap.profile == Profile::FullBlast || snap.full_blast);
+
+            let profile_name = if snap.full_blast || snap.profile == Profile::FullBlast {
+                "Full Blast"
+            } else {
+                match snap.profile {
+                    Profile::Auto => "Auto",
+                    Profile::Custom => "Custom Curve",
+                    Profile::Silent => "Silent",
+                    Profile::FullBlast => "Full Blast",
+                }
+            };
+            let mut tip = format!("WMF Control [{profile_name}]");
+            if let Some(cpu) = cpu_txt {
+                tip += &format!("\nCPU: {cpu}");
+            }
+            for f in &snap.fans {
+                tip += &format!("\nFan {}: {:.0} RPM", f.index + 1, f.actual);
+            }
+            t.set_tooltip(tip);
         }
     }
 
@@ -112,7 +260,7 @@ impl App {
     fn restart(&mut self, demo: bool) {
         self.worker.shutdown();
         self.demo = demo;
-        self.worker = spawn(&self.ctx, demo, self.no_mmio);
+        self.worker = spawn(&self.ctx, demo, self.no_mmio, self.win.hidden.clone());
         *self.worker_slot.lock().unwrap() = self.worker.clone();
     }
 
@@ -320,31 +468,27 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let ctx = &root.ctx().clone();
-        let snap = self.worker.shared.lock().unwrap().clone();
-
         if self.win.hwnd.load(Ordering::Relaxed) == 0 {
             if let Some(h) = hwnd_of(frame) {
                 self.win.hwnd.store(h, Ordering::Relaxed);
+                if self.win.hidden.load(Ordering::Relaxed) {
+                    self.win.hide();
+                }
             }
         }
         // Minimize → hide to the tray is done by the watcher thread in WindowCtl.
         self.win.minimize_to_tray.store(self.minimize_to_tray && self.tray.is_some(), Ordering::Relaxed);
-        let cpu_txt = snap.sensors.iter().find(|s| s.key == "TC0P").map(|s| self.fmt_temp(s.value));
-        if let Some(t) = &mut self.tray {
-            t.blast_item.set_checked(snap.full_blast);
-            let mut tip = format!("{} – by {}", crate::APP_NAME, crate::AUTHOR);
-            if snap.full_blast {
-                tip += " – FULL BLAST";
-            }
-            for f in &snap.fans {
-                tip += &format!("\nFan {}: {:.0} RPM", f.index + 1, f.actual);
-            }
-            if let Some(cpu) = cpu_txt {
-                tip += &format!("\nCPU: {cpu}");
-            }
-            t.set_tooltip(tip);
+
+        let snap = self.worker.shared.lock().unwrap().clone();
+        self.update_tray(&snap);
+
+        // When hidden in tray, completely skip rendering UI and ensure viewport is hidden
+        if self.win.hidden.load(Ordering::Relaxed) {
+            root.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
         }
+
+        let ctx = &root.ctx().clone();
 
         egui::Panel::top("top").show(root, |ui| {
             ui.horizontal(|ui| {
@@ -367,18 +511,40 @@ impl eframe::App for App {
                         let mut changed = ui.checkbox(&mut self.fahrenheit, "Show °F").changed();
                         changed |= ui.checkbox(&mut self.show_all, "Show unnamed sensors").changed();
                         changed |= ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray").changed();
+                        if ui.checkbox(&mut self.start_minimized, "Start minimized to tray").changed() {
+                            let mut c = Config::load();
+                            c.start_minimized = self.start_minimized;
+                            c.save();
+                        }
+                        let mut auto = self.autostart;
+                        if ui.checkbox(&mut auto, "Start with Windows (Task Scheduler, no UAC)").changed() {
+                            match set_autostart(auto) {
+                                Ok(()) => {
+                                    self.autostart = auto;
+                                    self.autostart_err = None;
+                                }
+                                Err(e) => {
+                                    self.autostart_err = Some(e.to_string());
+                                }
+                            }
+                        }
+                        if let Some(err) = &self.autostart_err {
+                            ui.label(RichText::new(format!("Autostart error: {err}")).color(Color32::from_rgb(240, 90, 80)).small());
+                        }
                         if changed {
                             self.send_prefs();
                         }
+                        ui.separator();
                         ui.horizontal(|ui| {
-                            ui.label("Refresh:");
-                            for ms in [500u64, 1000, 2000, 5000] {
+                            ui.label("Refresh (active window):");
+                            for ms in [1000u64, 1500, 2000, 5000] {
                                 if ui.selectable_label(self.poll_ms == ms, format!("{:.1}s", ms as f64 / 1000.0)).clicked() {
                                     self.poll_ms = ms;
                                     let _ = self.worker.tx.send(Command::SetPoll(ms));
                                 }
                             }
                         });
+                        ui.label(RichText::new("Background mode: 2.0s, polling only active fan/CPU sensors").weak().small());
                     });
                     if self.tray.is_some() && ui.button("Hide to tray").on_hover_text("Keeps running in the background; click the tray icon to come back").clicked() {
                         self.win.hide();

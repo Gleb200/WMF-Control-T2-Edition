@@ -5,6 +5,7 @@
 //! tray menu does is handled directly in the event handlers (they run on the UI
 //! thread's message loop) instead of waiting for the next egui frame.
 
+use crate::config::Profile;
 use crate::control::{Command, Worker};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,22 +47,25 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
 
 pub struct Tray {
     pub icon: TrayIcon,
-    pub blast_item: CheckMenuItem,
+    pub mode_auto: CheckMenuItem,
+    pub mode_custom: CheckMenuItem,
+    pub mode_silent: CheckMenuItem,
+    pub mode_blast: CheckMenuItem,
     last_tooltip: String,
 }
 
 pub struct WindowCtl {
     pub hwnd: AtomicIsize,
-    pub hidden: AtomicBool,
+    pub hidden: Arc<AtomicBool>,
     /// "Minimize to system tray" preference.
     pub minimize_to_tray: AtomicBool,
 }
 
 impl WindowCtl {
-    pub fn new(minimize_to_tray: bool) -> Arc<Self> {
+    pub fn new(minimize_to_tray: bool, start_hidden: bool) -> Arc<Self> {
         let w = Arc::new(WindowCtl {
             hwnd: AtomicIsize::new(0),
-            hidden: AtomicBool::new(false),
+            hidden: Arc::new(AtomicBool::new(start_hidden)),
             minimize_to_tray: AtomicBool::new(minimize_to_tray),
         });
         // A minimized window gets no egui frames, so watch the native state instead.
@@ -90,11 +94,11 @@ impl WindowCtl {
         let h = self.hwnd.load(Ordering::Relaxed);
         if h != 0 {
             unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(h as _, windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE) };
-            self.hidden.store(true, Ordering::Relaxed);
         }
+        self.hidden.store(true, Ordering::Relaxed);
     }
 
-    pub fn show(&self) {
+    pub fn show(&self, ctx: &eframe::egui::Context) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow};
         let h = self.hwnd.load(Ordering::Relaxed);
         if h != 0 {
@@ -103,20 +107,32 @@ impl WindowCtl {
                 ShowWindow(h as _, SW_RESTORE);
                 SetForegroundWindow(h as _);
             }
-            self.hidden.store(false, Ordering::Relaxed);
         }
+        self.hidden.store(false, Ordering::Relaxed);
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+        ctx.request_repaint();
     }
 }
 
 impl Tray {
     pub fn new(worker: Arc<Mutex<Worker>>, win: Arc<WindowCtl>, ctx: eframe::egui::Context) -> anyhow::Result<Self> {
+        let mode_auto = CheckMenuItem::new("Auto (Hardware)", true, false, None);
+        let mode_custom = CheckMenuItem::new("Custom Curve", true, true, None);
+        let mode_silent = CheckMenuItem::new("Silent", true, false, None);
+        let mode_blast = CheckMenuItem::new("Full Blast", true, false, None);
+        let sep1 = PredefinedMenuItem::separator();
         let show = MenuItem::new("Show WMF Control", true, None);
-        let blast_item = CheckMenuItem::new("Full Blast", true, false, None);
+        let sep2 = PredefinedMenuItem::separator();
         let quit = MenuItem::new("Quit (fans back to Auto)", true, None);
+
         let menu = Menu::new();
+        menu.append(&mode_auto)?;
+        menu.append(&mode_custom)?;
+        menu.append(&mode_silent)?;
+        menu.append(&mode_blast)?;
+        menu.append(&sep1)?;
         menu.append(&show)?;
-        menu.append(&blast_item)?;
-        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&sep2)?;
         menu.append(&quit)?;
 
         let icon = TrayIconBuilder::new()
@@ -126,18 +142,34 @@ impl Tray {
             .with_icon(Icon::from_rgba(icon_rgba(32), 32, 32)?)
             .build()?;
 
-        let (show_id, blast_id, quit_id) = (show.id().clone(), blast_item.id().clone(), quit.id().clone());
+        let auto_id = mode_auto.id().clone();
+        let custom_id = mode_custom.id().clone();
+        let silent_id = mode_silent.id().clone();
+        let blast_id = mode_blast.id().clone();
+        let show_id = show.id().clone();
+        let quit_id = quit.id().clone();
+
         {
             let (worker, win, ctx) = (worker.clone(), win.clone(), ctx.clone());
             MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-                if e.id == show_id {
-                    win.show();
+                if e.id == auto_id {
+                    let w = worker.lock().unwrap().clone();
+                    let _ = w.tx.send(Command::SetProfile(Profile::Auto));
+                    ctx.request_repaint();
+                } else if e.id == custom_id {
+                    let w = worker.lock().unwrap().clone();
+                    let _ = w.tx.send(Command::SetProfile(Profile::Custom));
+                    ctx.request_repaint();
+                } else if e.id == silent_id {
+                    let w = worker.lock().unwrap().clone();
+                    let _ = w.tx.send(Command::SetProfile(Profile::Silent));
                     ctx.request_repaint();
                 } else if e.id == blast_id {
                     let w = worker.lock().unwrap().clone();
-                    let on = !w.shared.lock().unwrap().full_blast;
-                    let _ = w.tx.send(Command::FullBlast(on));
+                    let _ = w.tx.send(Command::SetProfile(Profile::FullBlast));
                     ctx.request_repaint();
+                } else if e.id == show_id {
+                    win.show(&ctx);
                 } else if e.id == quit_id {
                     // Fans are handed back to the SMC before the process exits.
                     let w = worker.lock().unwrap().clone();
@@ -153,12 +185,18 @@ impl Tray {
                     | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }
             );
             if restore {
-                win.show();
-                ctx.request_repaint();
+                win.show(&ctx);
             }
         }));
 
-        Ok(Tray { icon, blast_item, last_tooltip: String::new() })
+        Ok(Tray {
+            icon,
+            mode_auto,
+            mode_custom,
+            mode_silent,
+            mode_blast,
+            last_tooltip: String::new(),
+        })
     }
 
     pub fn set_tooltip(&mut self, text: String) {

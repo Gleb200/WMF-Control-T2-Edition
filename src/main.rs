@@ -5,31 +5,84 @@
 //! Source: https://github.com/melinoe-ux/bootcamp-mac-fan-control-windows
 //! License: MIT
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 mod app;
 
 pub const APP_NAME: &str = "WMF Control";
-pub const APP_FULL_NAME: &str = "Windows Mac Fan Control";
-pub const AUTHOR: &str = "melinoe-ux";
-pub const AUTHOR_URL: &str = "https://github.com/melinoe-ux";
-pub const REPO_URL: &str = "https://github.com/melinoe-ux/bootcamp-mac-fan-control-windows";
+pub const APP_FULL_NAME: &str = "Windows Mac Fan Control (T2 Edition)";
+pub const AUTHOR: &str = "melinoe-ux & Gleb200";
+pub const AUTHOR_URL: &str = "https://github.com/Gleb200/WMF-Control-T2-Edition";
+pub const REPO_URL: &str = "https://github.com/Gleb200/WMF-Control-T2-Edition";
+pub const ORIGINAL_REPO_URL: &str = "https://github.com/melinoe-ux/bootcamp-mac-fan-control-windows";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod config;
 mod control;
 mod io;
 mod sensors;
+mod shmem;
 mod sim;
 mod smc;
 mod tray;
 
 use eframe::egui;
 
+#[cfg(windows)]
+fn kill_other_instances() {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    unsafe {
+        let current_pid = GetCurrentProcessId();
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() {
+            return;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID != current_pid {
+                    let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+                    if name == "wmf-control.exe" {
+                        let h = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
+                        if !h.is_null() {
+                            TerminateProcess(h, 0);
+                            CloseHandle(h);
+                        }
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    kill_other_instances();
+
     let args: Vec<String> = std::env::args().collect();
     let demo = args.iter().any(|a| a == "--demo");
     let no_mmio = args.iter().any(|a| a == "--no-mmio");
+    let start_minimized_arg = args.iter().any(|a| a == "--minimized" || a == "-minimized" || a == "/tray" || a == "--tray");
+    let cfg = config::Config::load();
+    let start_minimized = start_minimized_arg || cfg.start_minimized;
 
+    if args.iter().any(|a| a == "--register-autostart") {
+        let _ = app::set_autostart(true);
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--selftest") {
         selftest(demo, no_mmio);
         return Ok(());
@@ -44,13 +97,15 @@ fn main() -> eframe::Result<()> {
             .with_title(format!("{APP_NAME} ({APP_FULL_NAME}) – by {AUTHOR}"))
             .with_inner_size([900.0, 600.0])
             .with_min_inner_size([640.0, 400.0])
+            .with_visible(!start_minimized)
+            .with_active(!start_minimized)
             .with_icon(std::sync::Arc::new(egui::IconData { rgba: tray::icon_rgba(32), width: 32, height: 32 })),
         ..Default::default()
     };
     eframe::run_native(
         "WMF Control",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo, no_mmio)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, demo, no_mmio, start_minimized)))),
     )
 }
 

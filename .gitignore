@@ -2,3 +2,30 @@
 /target-demo
 smc-dump.txt
 selftest.txt
+
+# Archives & binaries
+*.zip
+*.7z
+*.rar
+*.pdb
+*.exe
+!driver/*.dll
+*.dll
+!driver/inpoutx64.dll
+
+# Visual Studio / .NET / C#
+.vs/
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+
+# System & editor artifacts
+.vscode/
+.idea/
+*.log
+Thumbs.db
+Desktop.ini

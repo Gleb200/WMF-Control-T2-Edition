@@ -7,9 +7,11 @@
 //! leave the machine without cooling. If writing the minimum is refused, forced mode
 //! (`FnMd` / `FS!` + `FnTg`) is used as a fallback.
 
-use crate::config::{Config, FanMode};
+use crate::config::{Config, FanMode, Profile};
 use crate::sensors::{self, Kind};
 use crate::smc::{Key, Smc, key, key_str};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -47,12 +49,15 @@ pub struct Snapshot {
     pub ready: bool,
     pub poll: Duration,
     pub full_blast: bool,
+    pub profile: Profile,
 }
 
 pub enum Command {
     SetMode(u8, FanMode),
     /// Run every fan at maximum RPM (overrides the per-fan modes while on).
     FullBlast(bool),
+    SetProfile(Profile),
+    Reinit,
     SetPoll(u64),
     SetPrefs { fahrenheit: bool, show_all: bool, tray: bool },
     Quit,
@@ -67,14 +72,19 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(open: impl FnOnce() -> anyhow::Result<Smc> + Send + 'static, repaint: impl Fn() + Send + 'static) -> Self {
+    pub fn spawn(
+        open: impl FnOnce() -> anyhow::Result<Smc> + Send + 'static,
+        repaint: impl Fn() + Send + 'static,
+        is_hidden: Arc<AtomicBool>,
+        no_mmio: bool,
+    ) -> Self {
         let (tx, rx) = channel();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let sh = shared.clone();
         let handle = std::thread::Builder::new()
             .name("smc-worker".into())
             .spawn(move || match open() {
-                Ok(smc) => run(smc, rx, sh, repaint),
+                Ok(smc) => run(smc, rx, sh, repaint, is_hidden, no_mmio),
                 Err(e) => {
                     let mut s = sh.lock().unwrap();
                     s.error = Some(format!("{e:#}"));
@@ -103,7 +113,6 @@ fn fkey(i: u8, suffix: &str) -> Key {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Method {
-    MinSpeed,
     ForcedMd,
     ForcedFs,
 }
@@ -116,6 +125,12 @@ struct Fan {
     applied: Option<f64>,
 }
 
+#[derive(Clone, Copy)]
+struct CachedReading {
+    value: f64,
+    stale_count: u8,
+}
+
 struct Ctx {
     smc: Smc,
     cfg: Config,
@@ -124,21 +139,49 @@ struct Ctx {
     warnings: Vec<String>,
     overheat: bool,
     full_blast: bool,
+    no_mmio: bool,
+    cache: HashMap<Key, CachedReading>,
+    shmem: crate::shmem::SharedMem,
+    smoothed_targets: HashMap<u8, f64>,
+    peak_temps: HashMap<u8, f64>,
+    last_tick: Instant,
 }
 
 const OVERHEAT_ON: f64 = 90.0;
 const OVERHEAT_OFF: f64 = 85.0;
 
-fn run(smc: Smc, rx: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, repaint: impl Fn()) {
+fn run(
+    smc: Smc,
+    rx: Receiver<Command>,
+    shared: Arc<Mutex<Snapshot>>,
+    repaint: impl Fn(),
+    is_hidden: Arc<AtomicBool>,
+    no_mmio: bool,
+) {
     let cfg = Config::load();
-    let mut cx = Ctx { smc, cfg, fans: vec![], sensor_keys: vec![], warnings: vec![], overheat: false, full_blast: false };
+    let mut cx = Ctx {
+        smc,
+        cfg,
+        fans: vec![],
+        sensor_keys: vec![],
+        warnings: vec![],
+        overheat: false,
+        full_blast: false,
+        no_mmio,
+        cache: HashMap::new(),
+        shmem: crate::shmem::SharedMem::new(),
+        smoothed_targets: HashMap::new(),
+        peak_temps: HashMap::new(),
+        last_tick: Instant::now(),
+    };
     cx.discover();
     let key_total = cx.smc.key_count().unwrap_or(0);
     let transport = cx.smc.transport_name();
 
     loop {
+        let hidden = is_hidden.load(Ordering::Relaxed);
         let start = Instant::now();
-        let snap = cx.tick();
+        let snap = cx.tick(hidden);
         {
             let mut s = shared.lock().unwrap();
             *s = snap;
@@ -146,9 +189,16 @@ fn run(smc: Smc, rx: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, repaint: i
             s.key_total = key_total;
             s.ready = true;
         }
-        repaint();
+        if !hidden {
+            repaint();
+        }
 
-        let poll = Duration::from_millis(cx.cfg.poll_ms);
+        let poll_ms = if hidden {
+            cx.cfg.poll_ms.max(2000)
+        } else {
+            cx.cfg.poll_ms.clamp(1000, 1500)
+        };
+        let poll = Duration::from_millis(poll_ms);
         let deadline = start + poll;
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
@@ -164,10 +214,27 @@ fn run(smc: Smc, rx: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, repaint: i
                 }
                 Ok(Command::FullBlast(on)) => {
                     cx.full_blast = on;
+                    if on {
+                        cx.cfg.profile = Profile::FullBlast;
+                    } else if cx.cfg.profile == Profile::FullBlast {
+                        cx.cfg.profile = Profile::Custom;
+                    }
+                    cx.cfg.save();
+                    break;
+                }
+                Ok(Command::SetProfile(p)) => {
+                    cx.cfg.profile = p;
+                    cx.full_blast = p == Profile::FullBlast;
+                    cx.cfg.save();
+                    break;
+                }
+                Ok(Command::Reinit) => {
+                    let _ = cx.smc.reinit(!cx.no_mmio);
+                    cx.discover();
                     break;
                 }
                 Ok(Command::SetPoll(ms)) => {
-                    cx.cfg.poll_ms = ms.max(250);
+                    cx.cfg.poll_ms = ms.max(500);
                     cx.cfg.save();
                 }
                 Ok(Command::SetPrefs { fahrenheit, show_all, tray }) => {
@@ -185,42 +252,60 @@ fn run(smc: Smc, rx: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, repaint: i
 }
 
 impl Ctx {
+    fn write_with_retry(&mut self, k: &Key, val: f64) -> anyhow::Result<()> {
+        let mut last_err = None;
+        for _ in 0..3 {
+            match self.smc.write_f64(k, val) {
+                Ok(()) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            Err(e)
+        } else {
+            anyhow::bail!("Write failed for key {}", key_str(k))
+        }
+    }
+
     fn discover(&mut self) {
+        let _ = self.smc.reinit(!self.no_mmio);
         let count = self.smc.read_f64(&key("FNum")).unwrap_or(0.0) as u8;
         let has_md = self.smc.key_info(&fkey(0, "Md")).is_some();
         let has_fs = self.smc.key_info(&key("FS! ")).is_some();
+        self.fans.clear();
         for i in 0..count.min(8) {
-            let cur_min = self.smc.read_f64(&fkey(i, "Mn")).unwrap_or(0.0);
-            // A saved value means we changed the minimum in an earlier run.
-            let default_min = self.cfg.saved_min.get(&i).copied().unwrap_or(cur_min);
+            let cur_min = self.smc.read_f64(&fkey(i, "Mn")).unwrap_or(1800.0);
+            let default_min = if cur_min > 0.0 { cur_min } else { 1800.0 };
             let max = self.smc.read_f64(&fkey(i, "Mx")).unwrap_or(6000.0);
-            let method = if self.smc.key_info(&fkey(i, "Mn")).is_some() {
-                Method::MinSpeed
-            } else if has_md {
+            // On Apple T2 / Intel Macs, control is ALWAYS done via forced target RPM (FnMd / FS! + FnTg)
+            // FnMn is strictly read-only (error 0x86).
+            let method = if self.smc.key_info(&fkey(i, "Md")).is_some() || has_md {
                 Method::ForcedMd
             } else if has_fs {
                 Method::ForcedFs
             } else {
-                Method::MinSpeed
+                Method::ForcedMd
             };
             self.fans.push(Fan { index: i, default_min, max, method, applied: None });
         }
         if count == 0 {
             self.warnings.push("SMC reports no fans (FNum = 0)".into());
         }
-        // After a crash, put the factory minimum back before doing anything else.
-        let saved: Vec<(u8, f64)> = self.cfg.saved_min.iter().map(|(a, b)| (*a, *b)).collect();
-        for (i, v) in saved {
-            let _ = self.smc.write_f64(&fkey(i, "Mn"), v);
+        // Release any forced modes from a previous crashed run. NEVER write to FnMn!
+        for i in 0..count.min(8) {
+            let _ = self.write_with_retry(&fkey(i, "Md"), 0.0);
+        }
+        if has_fs {
+            let _ = self.write_with_retry(&key("FS! "), 0.0);
         }
         self.cfg.saved_min.clear();
         self.cfg.save();
-        // A previous run may have died while a fan was in forced mode: release it.
-        for i in 0..count.min(8) {
-            if self.smc.key_info(&fkey(i, "Md")).is_some() {
-                let _ = self.smc.write_f64(&fkey(i, "Md"), 0.0);
-            }
-        }
         self.discover_sensors();
     }
 
@@ -243,7 +328,16 @@ impl Ctx {
             if info.len > 8 {
                 continue;
             }
-            let Some(v) = self.smc.read_f64(&k) else { continue };
+            // Retry up to 3 times with 8ms delay so sensor list is complete and stable
+            let mut read_val = None;
+            for _ in 0..3 {
+                if let Some(v) = self.smc.read_f64(&k) {
+                    read_val = Some(v);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            let Some(v) = read_val else { continue };
             if !kind.plausible(v) {
                 continue;
             }
@@ -257,18 +351,83 @@ impl Ctx {
         self.sensor_keys.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
     }
 
-    fn tick(&mut self) -> Snapshot {
-        let mut sensors = Vec::with_capacity(self.sensor_keys.len());
-        for (k, kind, name) in &self.sensor_keys {
-            if let Some(v) = self.smc.read_f64(k) {
-                sensors.push(Sensor { key: key_str(k), name: name.clone(), kind: *kind, value: v });
+    fn read_f64_cached(&mut self, k: &Key) -> Option<f64> {
+        match self.smc.read_f64(k) {
+            Some(v) => {
+                self.cache.insert(*k, CachedReading { value: v, stale_count: 0 });
+                Some(v)
+            }
+            None => {
+                if let Some(entry) = self.cache.get_mut(k) {
+                    if entry.stale_count < 3 {
+                        entry.stale_count += 1;
+                        Some(entry.value)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn tick(&mut self, hidden: bool) -> Snapshot {
+        let now = Instant::now();
+        let elapsed = self.last_tick.elapsed();
+        self.last_tick = now;
+        // Wakeup / sleep detection: normal interval is 1-2s. If > 6s elapsed, system was suspended
+        if elapsed > Duration::from_secs(6) {
+            let _ = self.smc.reinit(!self.no_mmio);
+            self.cache.clear();
+            self.smoothed_targets.clear();
+            self.peak_temps.clear();
+        }
+
+        // 1. In the very beginning of the sensor update cycle (before fan control commands):
+        // Read CPU PECI (TCXC, fallback to TC1C or TC0P) and immediately write to Local\WMF_CpuTemp (4-byte float)
+        let cpu_temp = self.read_f64_cached(&key("TCXC"))
+            .or_else(|| self.read_f64_cached(&key("TC1C")))
+            .or_else(|| self.read_f64_cached(&key("TC0P")))
+            .unwrap_or(0.0);
+        self.shmem.write_cpu_temp(cpu_temp);
+
+        let mut needed_keys: Vec<Key> = Vec::new();
+        if hidden {
+            // Essential keys for tray icon & CPU temp
+            needed_keys.push(key("TC0P"));
+            needed_keys.push(key("TCXC"));
+            needed_keys.push(key("TC1C"));
+            // Overheat protection sensors
+            needed_keys.push(key("TG0P"));
+            needed_keys.push(key("TG0D"));
+            // Active fan curve sensor(s)
+            for fi in 0..self.fans.len() {
+                let mode = self.cfg.fans.get(&self.fans[fi].index).cloned().unwrap_or_default();
+                if let FanMode::Sensor { ref key, .. } = mode {
+                    needed_keys.push(crate::smc::key(key));
+                }
             }
         }
 
-        // Overheat guard (hysteresis 90 °C on / 85 °C off): any custom mode is
-        // overridden with full speed. Important for forced mode, where the SMC
-        // no longer raises the fan by itself.
-        let hot = Self::hottest(&sensors);
+        let mut sensors = Vec::with_capacity(self.sensor_keys.len());
+        let sensor_keys = self.sensor_keys.clone();
+        for (k, kind, name) in &sensor_keys {
+            if hidden && !needed_keys.contains(k) {
+                // Background mode: reuse cached value if available, avoid bus transaction
+                if let Some(entry) = self.cache.get(k) {
+                    sensors.push(Sensor { key: key_str(k), name: name.clone(), kind: *kind, value: entry.value });
+                }
+                continue;
+            }
+            if let Some(v) = self.read_f64_cached(k) {
+                sensors.push(Sensor { key: key_str(k), name: name.clone(), kind: *kind, value: v });
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Overheat guard (hysteresis 90 °C on / 85 °C off)
+        let hot = Self::hottest(&sensors).max(cpu_temp);
         if hot >= OVERHEAT_ON {
             self.overheat = true;
         } else if hot < OVERHEAT_OFF {
@@ -278,59 +437,110 @@ impl Ctx {
         let mut fans = Vec::new();
         let mut errors = Vec::new();
         if self.overheat {
-            errors.push(format!("Overheat guard active ({hot:.0} °C): custom fans at maximum"));
+            errors.push(format!("Overheat guard active ({hot:.0} °C): fans at maximum"));
         }
+
+        let active_profile = self.cfg.profile;
+        let is_blast = self.full_blast || active_profile == Profile::FullBlast;
+
         for fi in 0..self.fans.len() {
             let mode = self.cfg.fans.get(&self.fans[fi].index).cloned().unwrap_or_default();
-            let mut target = self.target_for(fi, &mode, &sensors);
-            if self.full_blast || (self.overheat && target.is_some()) {
-                target = Some(self.fans[fi].max);
-            }
+            let target = match active_profile {
+                _ if is_blast => Some(self.fans[fi].max),
+                _ if self.overheat => Some(self.fans[fi].max),
+                Profile::Auto => None,
+                Profile::Silent => Some(self.fans[fi].default_min),
+                Profile::FullBlast => Some(self.fans[fi].max),
+                Profile::Custom => self.target_for(fi, &mode, &sensors),
+            };
             if let Err(e) = self.apply(fi, target) {
                 errors.push(format!("Fan {}: {e:#}", self.fans[fi].index + 1));
             }
-            let f = &self.fans[fi];
+            let (idx, default_min, max, applied, method) = {
+                let f = &self.fans[fi];
+                (f.index, f.default_min, f.max, f.applied, f.method)
+            };
+            let actual = self.read_f64_cached(&fkey(idx, "Ac")).unwrap_or(0.0);
+            std::thread::sleep(Duration::from_millis(2));
+            let min = self.read_f64_cached(&fkey(idx, "Mn")).unwrap_or(default_min);
+            std::thread::sleep(Duration::from_millis(2));
+
             fans.push(FanState {
-                index: f.index,
-                actual: self.smc.read_f64(&fkey(f.index, "Ac")).unwrap_or(0.0),
-                min: self.smc.read_f64(&fkey(f.index, "Mn")).unwrap_or(f.default_min),
-                max: f.max,
-                default_min: f.default_min,
-                requested: f.applied,
+                index: idx,
+                actual,
+                min,
+                max,
+                default_min,
+                requested: applied,
                 mode,
-                method: match f.method {
-                    Method::MinSpeed => "min speed",
+                method: match method {
                     Method::ForcedMd => "forced (FnMd)",
                     Method::ForcedFs => "forced (FS!)",
                 },
             });
         }
 
+        // Update full status in Windows Named Shared Memory Local\WMF_CpuTemp
+        let fan1 = fans.get(0).map(|f| f.actual).unwrap_or(0.0);
+        let fan2 = fans.get(1).map(|f| f.actual).unwrap_or(0.0);
+        self.shmem.write_status(cpu_temp, fan1, fan2);
+
         let mut warnings = self.warnings.clone();
         warnings.extend(errors);
+        let poll_ms = if hidden {
+            self.cfg.poll_ms.max(2000)
+        } else {
+            self.cfg.poll_ms.clamp(1000, 1500)
+        };
         Snapshot {
             fans,
             sensors,
             warnings,
-            poll: Duration::from_millis(self.cfg.poll_ms),
-            full_blast: self.full_blast,
+            poll: Duration::from_millis(poll_ms),
+            full_blast: is_blast,
+            profile: active_profile,
             ..Default::default()
         }
     }
 
-    fn target_for(&self, fi: usize, mode: &FanMode, sensors: &[Sensor]) -> Option<f64> {
-        let f = &self.fans[fi];
+    fn target_for(&mut self, fi: usize, mode: &FanMode, sensors: &[Sensor]) -> Option<f64> {
+        let (idx, default_min, max) = {
+            let f = &self.fans[fi];
+            (f.index, f.default_min, f.max)
+        };
         match mode {
             FanMode::Auto => None,
-            FanMode::Constant { rpm } => Some(rpm.clamp(f.default_min, f.max)),
+            FanMode::Constant { rpm } => {
+                let clamped = rpm.clamp(default_min, max);
+                self.smoothed_targets.insert(idx, clamped);
+                Some(clamped)
+            }
             FanMode::Sensor { key, low, high } => {
                 // Fail safe: if the sensor disappears, run at full speed.
                 let Some(t) = sensors.iter().find(|s| &s.key == key).map(|s| s.value) else {
-                    return Some(f.max);
+                    return Some(max);
                 };
+                // Hysteresis: only lower the tracked temperature after a 2.5 °C cooldown
+                let peak = self.peak_temps.entry(idx).or_insert(t);
+                if t > *peak {
+                    *peak = t;
+                } else if t < *peak - 2.5 {
+                    *peak = t + 2.5;
+                }
+                let effective_t = (*peak).max(t);
                 let span = (high - low).max(1.0);
-                let r = ((t - low) / span).clamp(0.0, 1.0);
-                Some(f.default_min + (f.max - f.default_min) * r)
+                let r = ((effective_t - low) / span).clamp(0.0, 1.0);
+                let raw_target = default_min + (max - default_min) * r;
+                let target_clamped = raw_target.clamp(default_min, max);
+
+                // Smooth RPM ramping: max +250 RPM up, max -80 RPM down per cycle
+                let prev = self.smoothed_targets.entry(idx).or_insert(target_clamped);
+                if target_clamped > *prev {
+                    *prev = (*prev + 250.0).min(target_clamped);
+                } else if target_clamped < *prev {
+                    *prev = (*prev - 80.0).max(target_clamped);
+                }
+                Some(*prev)
             }
         }
     }
@@ -350,59 +560,36 @@ impl Ctx {
             return Ok(());
         }
         let res = self.write_target(index, method, target);
-        if res.is_err() && method == Method::MinSpeed && target.is_some() {
-            // Some SMC firmware refuses FnMn writes: try forced mode instead.
-            let alt = if self.smc.key_info(&fkey(index, "Md")).is_some() {
-                Some(Method::ForcedMd)
-            } else if self.smc.key_info(&key("FS! ")).is_some() {
-                Some(Method::ForcedFs)
-            } else {
-                None
-            };
-            if let Some(alt) = alt {
-                if self.write_target(index, alt, target).is_ok() {
-                    self.fans[fi].method = alt;
-                    self.fans[fi].applied = target;
-                    return Ok(());
-                }
-            }
+        if res.is_ok() {
+            self.fans[fi].applied = target;
         }
-        res?;
-        self.fans[fi].applied = target;
-        Ok(())
+        res
     }
 
     fn write_target(&mut self, i: u8, method: Method, target: Option<f64>) -> anyhow::Result<()> {
-        let default_min = self.fans.iter().find(|f| f.index == i).map(|f| f.default_min).unwrap_or(0.0);
         match (method, target) {
-            (Method::MinSpeed, Some(rpm)) => {
-                if !self.cfg.saved_min.contains_key(&i) {
-                    self.cfg.saved_min.insert(i, default_min);
-                    self.cfg.save();
-                }
-                self.smc.write_f64(&fkey(i, "Mn"), rpm)
-            }
-            (Method::MinSpeed, None) => {
-                self.smc.write_f64(&fkey(i, "Mn"), default_min)?;
-                if self.cfg.saved_min.remove(&i).is_some() {
-                    self.cfg.save();
-                }
-                Ok(())
-            }
             (Method::ForcedMd, Some(rpm)) => {
-                self.smc.write_f64(&fkey(i, "Md"), 1.0)?;
-                self.smc.write_f64(&fkey(i, "Tg"), rpm)
+                // 1. Enable forced mode for fan i: FnMd = 1.0
+                let _ = self.write_with_retry(&fkey(i, "Md"), 1.0);
+                // 2. Set target RPM for fan i: FnTg = rpm
+                self.write_with_retry(&fkey(i, "Tg"), rpm)
             }
-            (Method::ForcedMd, None) => self.smc.write_f64(&fkey(i, "Md"), 0.0),
-            (Method::ForcedFs, t) => {
+            (Method::ForcedMd, None) => {
+                // Return fan i to automatic SMC hardware control: FnMd = 0.0
+                self.write_with_retry(&fkey(i, "Md"), 0.0)
+            }
+            (Method::ForcedFs, Some(rpm)) => {
                 let cur = self.smc.read_f64(&key("FS! ")).unwrap_or(0.0) as u16;
                 let bit = 1u16 << i;
-                let next = if t.is_some() { cur | bit } else { cur & !bit };
-                self.smc.write_f64(&key("FS! "), next as f64)?;
-                if let Some(rpm) = t {
-                    self.smc.write_f64(&fkey(i, "Tg"), rpm)?;
-                }
-                Ok(())
+                let next = cur | bit;
+                let _ = self.write_with_retry(&key("FS! "), next as f64);
+                self.write_with_retry(&fkey(i, "Tg"), rpm)
+            }
+            (Method::ForcedFs, None) => {
+                let cur = self.smc.read_f64(&key("FS! ")).unwrap_or(0.0) as u16;
+                let bit = 1u16 << i;
+                let next = cur & !bit;
+                self.write_with_retry(&key("FS! "), next as f64)
             }
         }
     }
@@ -412,13 +599,10 @@ impl Ctx {
         for fi in 0..self.fans.len() {
             let (i, m) = (self.fans[fi].index, self.fans[fi].method);
             let _ = self.write_target(i, m, None);
-            // also undo forced mode in case the fallback was ever used
-            if m == Method::MinSpeed {
-                if self.smc.key_info(&fkey(i, "Md")).is_some() {
-                    let _ = self.smc.write_f64(&fkey(i, "Md"), 0.0);
-                }
-            }
             self.fans[fi].applied = None;
+        }
+        if self.smc.key_info(&key("FS! ")).is_some() {
+            let _ = self.write_with_retry(&key("FS! "), 0.0);
         }
         self.cfg.saved_min.clear();
         self.cfg.save();
@@ -447,16 +631,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::set_var("APPDATA", &dir) };
 
-        let w = Worker::spawn(|| Ok(Smc::simulated()), || {});
+        let w = Worker::spawn(|| Ok(Smc::simulated()), || {}, Arc::new(AtomicBool::new(false)), false);
         let s = wait_for(&w, |s| s.fans.len() == 2);
         assert_eq!(s.fans[0].min, 1800.0);
         assert!(s.sensors.iter().any(|x| x.key == "TC0P"));
 
-        // constant: min speed raised, factory min remembered on disk
+        // constant: target speed set
         w.tx.send(Command::SetMode(0, FanMode::Constant { rpm: 4000.0 })).unwrap();
         let s = wait_for(&w, |s| s.fans[0].requested == Some(4000.0));
-        assert_eq!(s.fans[0].min, 4000.0);
-        assert_eq!(Config::load().saved_min.get(&0), Some(&1800.0));
+        assert_eq!(s.fans[0].requested, Some(4000.0));
 
         // clamped to [default_min, max]
         w.tx.send(Command::SetMode(1, FanMode::Constant { rpm: 99999.0 })).unwrap();

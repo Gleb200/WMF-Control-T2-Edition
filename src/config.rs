@@ -20,11 +20,27 @@ impl Default for FanMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Profile {
+    Auto,
+    Custom,
+    Silent,
+    FullBlast,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Profile::Custom
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Fan modes by fan index.
     pub fans: BTreeMap<u8, FanMode>,
+    /// Active profile: Auto, Custom, Silent, FullBlast.
+    pub profile: Profile,
     /// Factory minimum speeds, remembered while we have changed them so they can be
     /// restored even after a crash.
     pub saved_min: BTreeMap<u8, f64>,
@@ -33,6 +49,8 @@ pub struct Config {
     pub show_all_sensors: bool,
     /// Minimizing hides the window to the system tray unless this is set.
     pub no_minimize_to_tray: bool,
+    /// Launch directly into the system tray without showing the main window.
+    pub start_minimized: bool,
 }
 
 impl Config {
@@ -41,6 +59,14 @@ impl Config {
     }
 
     fn path() -> PathBuf {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let portable = parent.join("config.json");
+                if portable.exists() {
+                    return portable;
+                }
+            }
+        }
         Self::base().join("WMF Control").join("config.json")
     }
 
@@ -52,7 +78,7 @@ impl Config {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        if c.poll_ms < 250 {
+        if c.poll_ms < 500 {
             c.poll_ms = 1000;
         }
         c
