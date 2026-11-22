@@ -8,6 +8,7 @@
 **Lightweight, ultra-low-overhead fan control, sensor monitor, and feedforward AI thermal manager for Intel Macs running Windows 10/11 through Boot Camp.**
 
 Specially engineered and optimized for **Apple T2 chip models** (MacBook Pro 16" 2019, MacBook Pro 13"/15" 2018-2020, MacBook Air 2018-2020, iMac Pro, Mac mini 2018), while providing full backwards compatibility with earlier Intel Macs.
+<img src="https://github.com/user-attachments/assets/1af05750-0a85-4532-87a8-2feeca81b707" />
 
 > **WMF Control (Apple T2 & AI Thermal Edition)** | **License:** MIT
 
