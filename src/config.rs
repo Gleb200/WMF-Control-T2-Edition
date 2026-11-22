@@ -1,4 +1,4 @@
-// WMF Control (Windows Mac Fan Control) - by melinoe-ux (https://github.com/melinoe-ux) - MIT License
+﻿// WMF Control (Windows Mac Fan Control) - MIT License
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,6 +34,20 @@ impl Default for Profile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PredictiveMode {
+    Off,
+    Silent,
+    Balanced,
+    Aggressive,
+}
+
+impl Default for PredictiveMode {
+    fn default() -> Self {
+        PredictiveMode::Balanced
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -51,6 +65,13 @@ pub struct Config {
     pub no_minimize_to_tray: bool,
     /// Launch directly into the system tray without showing the main window.
     pub start_minimized: bool,
+    /// Adaptive Predictive Cooling sensitivity mode.
+    pub predictive_mode: PredictiveMode,
+    /// Self-calibrated online thermal gain (°C per Watt).
+    pub predictive_thermal_gain: Option<f64>,
+    /// Flag indicating if config file did not exist yet (triggers 1-Click Smart Setup).
+    #[serde(skip)]
+    pub is_first_run: bool,
 }
 
 impl Config {
@@ -71,13 +92,15 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        // Settings written under the old project name are picked up once.
+        let p = Self::path();
         let old = Self::base().join("MacFan").join("config.json");
-        let mut c: Config = std::fs::read_to_string(Self::path())
+        let is_first_run = !p.exists() && !old.exists();
+        let mut c: Config = std::fs::read_to_string(&p)
             .or_else(|_| std::fs::read_to_string(old))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        c.is_first_run = is_first_run;
         if c.poll_ms < 500 {
             c.poll_ms = 1000;
         }

@@ -1,4 +1,4 @@
-// WMF Control (Windows Mac Fan Control) - by melinoe-ux (https://github.com/melinoe-ux) - MIT License
+﻿// WMF Control (Windows Mac Fan Control) - MIT License
 use embed_manifest::manifest::ExecutionLevel;
 use embed_manifest::{embed_manifest, new_manifest};
 

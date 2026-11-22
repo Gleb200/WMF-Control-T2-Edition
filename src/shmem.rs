@@ -1,4 +1,4 @@
-// WMF Control (Windows Mac Fan Control) - by melinoe-ux - MIT License
+﻿// WMF Control (Windows Mac Fan Control) - MIT License
 //! Shared memory for external widgets (e.g. Touch Bar, rainmeter, DFRDisplayKm).
 //! Exposes current CPU temperature and fan RPMs via Windows Named Shared Memory: `Local\WMF_CpuTemp`.
 

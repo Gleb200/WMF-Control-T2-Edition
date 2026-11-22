@@ -1,4 +1,4 @@
-// WMF Control (Windows Mac Fan Control) - by melinoe-ux (https://github.com/melinoe-ux) - MIT License
+﻿// WMF Control (Windows Mac Fan Control) - MIT License
 //! Background worker: polls the SMC, applies fan rules, publishes snapshots to the UI.
 //!
 //! Control strategy: we never take the fan away from
@@ -28,6 +28,7 @@ pub struct FanState {
     pub requested: Option<f64>,
     pub mode: FanMode,
     pub method: &'static str,
+    pub predictive_boost: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,8 @@ pub struct Snapshot {
     pub poll: Duration,
     pub full_blast: bool,
     pub profile: Profile,
+    pub predictive: crate::predictive::PredictiveState,
+    pub smart_setup_msg: Option<String>,
 }
 
 pub enum Command {
@@ -57,6 +60,8 @@ pub enum Command {
     /// Run every fan at maximum RPM (overrides the per-fan modes while on).
     FullBlast(bool),
     SetProfile(Profile),
+    SetPredictiveMode(crate::config::PredictiveMode),
+    SmartSetup,
     Reinit,
     SetPoll(u64),
     SetPrefs { fahrenheit: bool, show_all: bool, tray: bool },
@@ -145,10 +150,13 @@ struct Ctx {
     smoothed_targets: HashMap<u8, f64>,
     peak_temps: HashMap<u8, f64>,
     last_tick: Instant,
+    predictive_engine: crate::predictive::PredictiveThermalEngine,
+    predictive_state: crate::predictive::PredictiveState,
+    smart_setup_msg: Option<(String, Instant)>,
 }
 
-const OVERHEAT_ON: f64 = 90.0;
-const OVERHEAT_OFF: f64 = 85.0;
+const OVERHEAT_ON: f64 = 98.0;
+const OVERHEAT_OFF: f64 = 90.0;
 
 fn run(
     smc: Smc,
@@ -159,6 +167,10 @@ fn run(
     no_mmio: bool,
 ) {
     let cfg = Config::load();
+    let predictive_engine = crate::predictive::PredictiveThermalEngine::new(
+        cfg.predictive_mode,
+        cfg.predictive_thermal_gain,
+    );
     let mut cx = Ctx {
         smc,
         cfg,
@@ -173,6 +185,9 @@ fn run(
         smoothed_targets: HashMap::new(),
         peak_temps: HashMap::new(),
         last_tick: Instant::now(),
+        predictive_engine,
+        predictive_state: crate::predictive::PredictiveState::default(),
+        smart_setup_msg: None,
     };
     cx.discover();
     let key_total = cx.smc.key_count().unwrap_or(0);
@@ -226,6 +241,17 @@ fn run(
                     cx.cfg.profile = p;
                     cx.full_blast = p == Profile::FullBlast;
                     cx.cfg.save();
+                    break;
+                }
+                Ok(Command::SetPredictiveMode(m)) => {
+                    cx.predictive_engine.set_mode(m);
+                    cx.cfg.predictive_mode = m;
+                    cx.cfg.save();
+                    break;
+                }
+                Ok(Command::SmartSetup) => {
+                    let msg = cx.perform_smart_setup();
+                    cx.smart_setup_msg = Some((msg, Instant::now()));
                     break;
                 }
                 Ok(Command::Reinit) => {
@@ -307,13 +333,81 @@ impl Ctx {
         self.cfg.saved_min.clear();
         self.cfg.save();
         self.discover_sensors();
+        if self.cfg.is_first_run {
+            self.cfg.is_first_run = false;
+            let msg = self.perform_smart_setup();
+            self.smart_setup_msg = Some((msg, Instant::now()));
+        }
+    }
+
+    fn perform_smart_setup(&mut self) -> String {
+        // 1. Scan available sensors to find best CPU and GPU sensors
+        // Priority: TCXC (PECI) -> TC0E / TC0F (Die) -> TC0P -> TC1C..TC8C
+        let cpu_sensor_key = self.sensor_keys.iter()
+            .find(|(k, _, _)| key_str(k) == "TCXC")
+            .or_else(|| self.sensor_keys.iter().find(|(k, _, _)| key_str(k) == "TC0E" || key_str(k) == "TC0F"))
+            .or_else(|| self.sensor_keys.iter().find(|(k, _, _)| key_str(k) == "TC0P"))
+            .or_else(|| self.sensor_keys.iter().find(|(k, _, _)| key_str(k) == "TC1C"))
+            .map(|(k, _, _)| key_str(k))
+            .unwrap_or_else(|| "TCXC".to_string());
+
+        // Check if discrete GPU sensor is present with valid temperature > 10 °C
+        let gpu_sensor_key = self.sensor_keys.iter()
+            .find(|(k, _, _)| key_str(k) == "TG0D" || key_str(k) == "TGDD")
+            .or_else(|| self.sensor_keys.iter().find(|(k, _, _)| key_str(k) == "TG0P"))
+            .map(|(k, _, _)| key_str(k));
+
+        let has_gpu = if let Some(ref gk_str) = gpu_sensor_key {
+            let gk = crate::smc::key(gk_str);
+            self.read_f64_cached(&gk).unwrap_or(0.0) > 10.0
+        } else {
+            false
+        };
+
+        // 2. Configure fan curves: start ramping at 62 °C, reach 100% at 93 °C
+        let low = 62.0;
+        let high = 93.0;
+        let mut summary_parts = Vec::new();
+
+        for i in 0..self.fans.len() {
+            let fan_idx = self.fans[i].index;
+            let chosen_key = if i == 1 && has_gpu {
+                // Fan 2 (right fan) assigned to GPU on dual-fan MacBook Pros
+                gpu_sensor_key.clone().unwrap()
+            } else {
+                cpu_sensor_key.clone()
+            };
+
+            let mode = FanMode::Sensor {
+                key: chosen_key.clone(),
+                low,
+                high,
+            };
+            self.cfg.fans.insert(fan_idx, mode);
+            let s_name = crate::sensors::name(&chosen_key).unwrap_or_else(|| chosen_key.clone());
+            summary_parts.push(format!("Fan {} ({} {:.0}°C -> {:.0}°C)", fan_idx + 1, s_name, low, high));
+        }
+
+        // 3. Set profile to Custom & Predictive Cooling to Balanced
+        self.cfg.profile = Profile::Custom;
+        self.full_blast = false;
+        self.cfg.predictive_mode = crate::config::PredictiveMode::Balanced;
+        self.predictive_engine.set_mode(crate::config::PredictiveMode::Balanced);
+
+        self.cfg.save();
+
+        let desc = summary_parts.join(", ");
+        format!("Auto-configured: {desc} + Predictive Balanced")
     }
 
     /// Hottest CPU / GPU temperature, used by the overheat guard.
     fn hottest(sensors: &[Sensor]) -> f64 {
         sensors
             .iter()
-            .filter(|s| s.kind == Kind::Temperature && (s.key.starts_with("TC") || s.key.starts_with("TG")))
+            .filter(|s| {
+                s.kind == Kind::Temperature
+                    && (s.key == "TCXC" || s.key == "TC0P" || s.key == "TC0D" || s.key == "TG0D" || s.key == "TG0P")
+            })
             .map(|s| s.value)
             .fold(0.0, f64::max)
     }
@@ -401,6 +495,13 @@ impl Ctx {
             // Overheat protection sensors
             needed_keys.push(key("TG0P"));
             needed_keys.push(key("TG0D"));
+            // Power telemetry for predictive cooling
+            needed_keys.push(key("PCPT"));
+            needed_keys.push(key("PCTR"));
+            needed_keys.push(key("PCPC"));
+            needed_keys.push(key("PC0R"));
+            needed_keys.push(key("PG0R"));
+            needed_keys.push(key("PSTR"));
             // Active fan curve sensor(s)
             for fi in 0..self.fans.len() {
                 let mode = self.cfg.fans.get(&self.fans[fi].index).cloned().unwrap_or_default();
@@ -424,6 +525,24 @@ impl Ctx {
                 sensors.push(Sensor { key: key_str(k), name: name.clone(), kind: *kind, value: v });
             }
             std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // 2. Predictive Thermal Engine update:
+        // Read CPU Package / System power from SMC (fallback to load-based estimate)
+        let cpu_pwr = self.read_f64_cached(&key("PCPT"))
+            .or_else(|| self.read_f64_cached(&key("PCTR")))
+            .or_else(|| self.read_f64_cached(&key("PCPC")))
+            .or_else(|| self.read_f64_cached(&key("PC0R")))
+            .or_else(|| self.read_f64_cached(&key("PSTR")));
+        let gpu_pwr = self.read_f64_cached(&key("PG0R"))
+            .or_else(|| self.read_f64_cached(&key("PGTR")))
+            .unwrap_or(0.0);
+        let total_pwr = cpu_pwr.map(|p| p + gpu_pwr);
+
+        self.predictive_state = self.predictive_engine.update(cpu_temp, total_pwr);
+        if self.predictive_engine.check_and_clear_save_request() {
+            self.cfg.predictive_thermal_gain = Some(self.predictive_engine.current_gain());
+            self.cfg.save();
         }
 
         // Overheat guard (hysteresis 90 °C on / 85 °C off)
@@ -465,6 +584,15 @@ impl Ctx {
             let min = self.read_f64_cached(&fkey(idx, "Mn")).unwrap_or(default_min);
             std::thread::sleep(Duration::from_millis(2));
 
+            let predictive_boost = if self.predictive_engine.is_enabled()
+                && self.predictive_state.boost_c > 0.5
+                && matches!(mode, FanMode::Sensor { .. })
+            {
+                Some(self.predictive_state.boost_c)
+            } else {
+                None
+            };
+
             fans.push(FanState {
                 index: idx,
                 actual,
@@ -477,6 +605,7 @@ impl Ctx {
                     Method::ForcedMd => "forced (FnMd)",
                     Method::ForcedFs => "forced (FS!)",
                 },
+                predictive_boost,
             });
         }
 
@@ -492,6 +621,15 @@ impl Ctx {
         } else {
             self.cfg.poll_ms.clamp(1000, 1500)
         };
+        let smart_msg = if let Some((msg, created)) = &self.smart_setup_msg {
+            if created.elapsed() < Duration::from_secs(8) {
+                Some(msg.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Snapshot {
             fans,
             sensors,
@@ -499,6 +637,8 @@ impl Ctx {
             poll: Duration::from_millis(poll_ms),
             full_blast: is_blast,
             profile: active_profile,
+            predictive: self.predictive_state.clone(),
+            smart_setup_msg: smart_msg,
             ..Default::default()
         }
     }
@@ -520,17 +660,29 @@ impl Ctx {
                 let Some(t) = sensors.iter().find(|s| &s.key == key).map(|s| s.value) else {
                     return Some(max);
                 };
+
+                // Adaptive Predictive Cooling: feedforward ahead of silicon temperature rise
+                let effective_input_t = if self.predictive_engine.is_enabled()
+                    && (key.starts_with("TC") || key.starts_with("TG"))
+                {
+                    t + self.predictive_state.boost_c
+                } else {
+                    t
+                };
+
                 // Hysteresis: only lower the tracked temperature after a 2.5 °C cooldown
-                let peak = self.peak_temps.entry(idx).or_insert(t);
-                if t > *peak {
-                    *peak = t;
-                } else if t < *peak - 2.5 {
-                    *peak = t + 2.5;
+                let peak = self.peak_temps.entry(idx).or_insert(effective_input_t);
+                if effective_input_t > *peak {
+                    *peak = effective_input_t;
+                } else if effective_input_t < *peak - 2.5 {
+                    *peak = effective_input_t + 2.5;
                 }
-                let effective_t = (*peak).max(t);
+                let effective_t = (*peak).max(effective_input_t);
                 let span = (high - low).max(1.0);
                 let r = ((effective_t - low) / span).clamp(0.0, 1.0);
-                let raw_target = default_min + (max - default_min) * r;
+                // Acoustic power curve ratio.powf(1.4) keeps fans quiet (2000-3400 RPM) at 60-75°C
+                let ratio = r.powf(1.4);
+                let raw_target = default_min + (max - default_min) * ratio;
                 let target_clamped = raw_target.clamp(default_min, max);
 
                 // Smooth RPM ramping: max +250 RPM up, max -80 RPM down per cycle

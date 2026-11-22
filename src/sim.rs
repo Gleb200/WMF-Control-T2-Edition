@@ -1,4 +1,4 @@
-// WMF Control (Windows Mac Fan Control) - by melinoe-ux (https://github.com/melinoe-ux) - MIT License
+﻿// WMF Control (Windows Mac Fan Control) - MIT License
 //! A fake SMC so the UI and control logic can be tried without the driver
 //! (`wmf-control.exe --demo`). Modelled after a MacBookPro16,1 (T2, `flt` fan keys).
 
@@ -36,7 +36,7 @@ impl SimSmc {
         ] {
             s.set(k, info("flt ", 4), v);
         }
-        for (k, v) in [("PSTR", 18.5), ("PCPC", 7.2), ("PDTR", 22.0), ("VD0R", 20.1), ("ID0R", 1.1), ("VP0R", 12.2)] {
+        for (k, v) in [("PSTR", 18.5), ("PCPT", 14.5), ("PCPC", 7.2), ("PDTR", 22.0), ("VD0R", 20.1), ("ID0R", 1.1), ("VP0R", 12.2)] {
             s.set(k, info("flt ", 4), v);
         }
         let n = s.keys.len() as f64 + 1.0;

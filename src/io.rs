@@ -1,4 +1,4 @@
-// WMF Control (Windows Mac Fan Control) - by melinoe-ux (https://github.com/melinoe-ux) - MIT License
+﻿// WMF Control (Windows Mac Fan Control) - MIT License
 //! Low level hardware access (I/O ports and physical memory).
 //!
 //! User-mode programs cannot touch I/O ports or physical memory on Windows, so a
